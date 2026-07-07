@@ -1,4 +1,9 @@
+﻿chroma_sessions/
+chroma_db/
+*.db
+temp_*.png
+temp_*.pdf
 venv/
 __pycache__/
+*.pyc
 .env
-chroma_db/

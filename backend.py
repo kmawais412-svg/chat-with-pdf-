@@ -90,6 +90,11 @@ def root():
     return {"status": "DocuChat AI Backend chal raha hai ✅"}
 
 
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "version": "1.0.1"}
+
+
 @app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)):
     """PDF upload kar ke process karna aur permanent session banana"""

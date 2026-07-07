@@ -1,19 +1,20 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 import os
+import json
 import tempfile
 import uuid
-import sqlite3
 import shutil
 import time
 from datetime import datetime
+from sqlalchemy import create_engine, text
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_groq import ChatGroq
 from langchain_chroma import Chroma
 from langchain_community.chat_message_histories import SQLChatMessageHistory
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from groq import RateLimitError, APIConnectionError, APIStatusError, InternalServerError
 from dotenv import load_dotenv
 
@@ -29,43 +30,17 @@ app.add_middleware(
 )
 
 DB_FILE = "docuchat.db"
-CHAT_HISTORY_CONNECTION = f"sqlite:///{DB_FILE}"  # LangChain isi database mein history save karega
+CHAT_HISTORY_CONNECTION = f"sqlite:///{DB_FILE}"  # LangChain isi database mein sab kuch save karega
 CHROMA_STORAGE_DIR = "chroma_sessions"
+
+# LangChain jo table khud banata hai (message_store) usay directly query karne ke liye engine
+engine = create_engine(CHAT_HISTORY_CONNECTION)
 
 vectorstore_cache = {}
 
 
-# ---------- Database Setup (sirf sessions table — messages ab LangChain sambhalta hai) ----------
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            session_id TEXT PRIMARY KEY,
-            filename TEXT,
-            title TEXT,
-            db_path TEXT,
-            pages INTEGER,
-            chunks INTEGER,
-            created_at TEXT
-        )
-    """)
-    conn.commit()
-
-    try:
-        c.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass  # column already exists
-
-    conn.close()
-
-
-init_db()
-
-
-def clean_text(text):
-    return text.encode('utf-8', 'ignore').decode('utf-8')
+def clean_text(text_):
+    return text_.encode('utf-8', 'ignore').decode('utf-8')
 
 
 def make_title_from_query(query: str) -> str:
@@ -82,6 +57,21 @@ def get_chat_history(session_id):
         session_id=session_id,
         connection=CHAT_HISTORY_CONNECTION
     )
+
+
+def get_session_meta(session_id):
+    """Session ka metadata LangChain history mein save kiye gaye System message se nikalna"""
+    history = get_chat_history(session_id)
+    system_messages = [m for m in history.messages if isinstance(m, SystemMessage)]
+    if not system_messages:
+        return None
+    return json.loads(system_messages[-1].content)
+
+
+def save_session_meta(session_id, meta: dict):
+    """Session ka metadata System message ke roop mein LangChain history mein save karna"""
+    history = get_chat_history(session_id)
+    history.add_message(SystemMessage(content=json.dumps(meta)))
 
 
 def get_vectorstore(session_id, db_path):
@@ -131,14 +121,14 @@ async def upload_pdf(file: UploadFile = File(...)):
     )
     vectorstore_cache[session_id] = vectorstore
 
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO sessions (session_id, filename, title, db_path, pages, chunks, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (session_id, file.filename, file.filename, db_path, len(pages), len(chunks), datetime.now().isoformat())
-    )
-    conn.commit()
-    conn.close()
+    save_session_meta(session_id, {
+        "filename": file.filename,
+        "title": file.filename,
+        "db_path": db_path,
+        "pages": len(pages),
+        "chunks": len(chunks),
+        "created_at": datetime.now().isoformat()
+    })
 
     os.unlink(tmp_path)
 
@@ -153,22 +143,23 @@ async def upload_pdf(file: UploadFile = File(...)):
 @app.get("/sessions")
 def list_sessions():
     """Sab purani chats ki list dena (title ke saath, ChatGPT jaisa)"""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT session_id, filename, title, created_at FROM sessions ORDER BY created_at DESC")
-    rows = c.fetchall()
-    conn.close()
+    with engine.connect() as conn:
+        result = conn.execute(text("SELECT DISTINCT session_id FROM message_store"))
+        session_ids = [row[0] for row in result]
 
-    return {
-        "sessions": [
-            {
-                "session_id": r[0],
-                "filename": r[1],
-                "title": r[2] if r[2] else r[1],
-                "created_at": r[3]
-            } for r in rows
-        ]
-    }
+    sessions = []
+    for sid in session_ids:
+        meta = get_session_meta(sid)
+        if meta:
+            sessions.append({
+                "session_id": sid,
+                "filename": meta.get("filename"),
+                "title": meta.get("title") or meta.get("filename"),
+                "created_at": meta.get("created_at")
+            })
+
+    sessions.sort(key=lambda s: s["created_at"] or "", reverse=True)
+    return {"sessions": sessions}
 
 
 @app.get("/sessions/{session_id}/messages")
@@ -177,6 +168,8 @@ def get_messages(session_id: str):
     history = get_chat_history(session_id)
     messages = []
     for msg in history.messages:
+        if isinstance(msg, SystemMessage):
+            continue  # ye sirf metadata hai, chat mein nahi dikhana
         role = "user" if isinstance(msg, HumanMessage) else "assistant"
         messages.append({"role": role, "content": msg.content})
     return {"messages": messages}
@@ -185,26 +178,19 @@ def get_messages(session_id: str):
 @app.delete("/sessions/{session_id}")
 def delete_session(session_id: str):
     """Ek chat ko poori tarah delete karna"""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT db_path FROM sessions WHERE session_id = ?", (session_id,))
-    row = c.fetchone()
+    meta = get_session_meta(session_id)
 
-    if row:
-        db_path = row[0]
-        c.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
-        conn.commit()
-
-        if os.path.exists(db_path):
+    if meta:
+        db_path = meta.get("db_path")
+        if db_path and os.path.exists(db_path):
             shutil.rmtree(db_path, ignore_errors=True)
 
-        vectorstore_cache.pop(session_id, None)
+    vectorstore_cache.pop(session_id, None)
 
-        # LangChain history bhi clear karna
-        history = get_chat_history(session_id)
-        history.clear()
+    # LangChain history (aur usmein maujood metadata) bhi clear karna
+    history = get_chat_history(session_id)
+    history.clear()
 
-    conn.close()
     return {"status": "deleted"}
 
 
@@ -212,28 +198,21 @@ def delete_session(session_id: str):
 async def chat(session_id: str = Form(...), query: str = Form(...)):
     """Ek session ke PDF se sawal poochna"""
 
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT db_path, title FROM sessions WHERE session_id = ?", (session_id,))
-    row = c.fetchone()
-
-    if not row:
-        conn.close()
+    meta = get_session_meta(session_id)
+    if not meta:
         return {"error": "Session nahi mila.", "answer": None, "sources": []}
 
-    db_path, current_title = row
+    db_path = meta["db_path"]
     vectorstore = get_vectorstore(session_id, db_path)
 
     # ---------- LangChain History Load Karna ----------
     history = get_chat_history(session_id)
+    real_messages = [m for m in history.messages if not isinstance(m, SystemMessage)]
 
     # Agar ye session ka pehla sawal hai, to title update karna (ChatGPT jaisa)
-    if len(history.messages) == 0:
-        new_title = make_title_from_query(query)
-        c.execute("UPDATE sessions SET title = ? WHERE session_id = ?", (new_title, session_id))
-        conn.commit()
-
-    conn.close()
+    if len(real_messages) == 0:
+        meta["title"] = make_title_from_query(query)
+        save_session_meta(session_id, meta)
 
     # Relevant chunks dhoondna
     results = vectorstore.similarity_search_with_score(query, k=5)
@@ -249,7 +228,7 @@ async def chat(session_id: str = Form(...), query: str = Form(...)):
             seen_pages.add(page_num)
 
     # Pichli history (last 6 messages) ko text mein convert karna
-    recent_messages = history.messages[-6:]
+    recent_messages = real_messages[-6:]
     history_text = ""
     for msg in recent_messages:
         role_label = "User" if isinstance(msg, HumanMessage) else "Assistant"
@@ -276,7 +255,6 @@ Current Question: {query}
 
 Answer:"""
 
-    # ---------- Groq API call with error handling + retry ----------
     answer = None
     max_retries = 2
 
@@ -323,7 +301,6 @@ Answer:"""
     if answer is None:
         return {"error": "Response nahi mil saka. Dobara try karein.", "answer": None, "sources": []}
 
-    # ---------- LangChain History Mein Save Karna ----------
     history.add_user_message(query)
     history.add_ai_message(answer)
 

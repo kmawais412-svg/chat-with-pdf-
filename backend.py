@@ -30,10 +30,9 @@ app.add_middleware(
 )
 
 DB_FILE = "docuchat.db"
-CHAT_HISTORY_CONNECTION = f"sqlite:///{DB_FILE}"  # LangChain isi database mein sab kuch save karega
+CHAT_HISTORY_CONNECTION = f"sqlite:///{DB_FILE}"
 CHROMA_STORAGE_DIR = "chroma_sessions"
 
-# LangChain jo table khud banata hai (message_store) usay directly query karne ke liye engine
 engine = create_engine(CHAT_HISTORY_CONNECTION)
 
 vectorstore_cache = {}
@@ -174,7 +173,7 @@ def get_messages(session_id: str):
     messages = []
     for msg in history.messages:
         if isinstance(msg, SystemMessage):
-            continue  # ye sirf metadata hai, chat mein nahi dikhana
+            continue
         role = "user" if isinstance(msg, HumanMessage) else "assistant"
         messages.append({"role": role, "content": msg.content})
     return {"messages": messages}
@@ -192,7 +191,6 @@ def delete_session(session_id: str):
 
     vectorstore_cache.pop(session_id, None)
 
-    # LangChain history (aur usmein maujood metadata) bhi clear karna
     history = get_chat_history(session_id)
     history.clear()
 
@@ -210,16 +208,13 @@ async def chat(session_id: str = Form(...), query: str = Form(...)):
     db_path = meta["db_path"]
     vectorstore = get_vectorstore(session_id, db_path)
 
-    # ---------- LangChain History Load Karna ----------
     history = get_chat_history(session_id)
     real_messages = [m for m in history.messages if not isinstance(m, SystemMessage)]
 
-    # Agar ye session ka pehla sawal hai, to title update karna (ChatGPT jaisa)
     if len(real_messages) == 0:
         meta["title"] = make_title_from_query(query)
         save_session_meta(session_id, meta)
 
-    # Relevant chunks dhoondna
     results = vectorstore.similarity_search_with_score(query, k=5)
     relevant_docs = [doc for doc, score in results if score < 1.0]
     context = "\n\n".join([doc.page_content for doc in relevant_docs]) if relevant_docs else "No relevant content found in the document."
@@ -232,7 +227,6 @@ async def chat(session_id: str = Form(...), query: str = Form(...)):
             sources.append(page_num + 1)
             seen_pages.add(page_num)
 
-    # Pichli history (last 6 messages) ko text mein convert karna
     recent_messages = real_messages[-6:]
     history_text = ""
     for msg in recent_messages:
@@ -248,7 +242,7 @@ Instructions:
 2. If the document context contains the answer, use it and base your response on it.
 3. If the document context does NOT contain the answer, then answer the question using your own general knowledge instead — do not say the information is missing, just answer normally as a helpful assistant would.
 4. Consider the conversation history to understand follow-up questions.
-5. Answer in the same language the question was asked in.
+5. Always respond in proper English language only. This means standard English words and grammar — NOT Roman Urdu (Urdu written in English letters), NOT Hindi, NOT any other language or transliteration. Even if the question is asked in Urdu, Roman Urdu, Hindi, or any mixed language, your entire answer must be written in clear, natural English.
 
 Document Context:
 {context}

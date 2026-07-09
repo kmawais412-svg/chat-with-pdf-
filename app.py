@@ -191,9 +191,11 @@ else:
                 answer = None
                 sources = []
                 try:
+                    # NOTE: backend ka /chat endpoint ab Pydantic ChatRequest (JSON body)
+                    # expect karta hai, isliye "data=" ki jagah "json=" use ho raha hai.
                     res = requests.post(
                         f"{BACKEND_URL}/chat",
-                        data={"session_id": st.session_state.session_id, "query": query}
+                        json={"session_id": st.session_state.session_id, "query": query}
                     )
                     if res.status_code == 200:
                         result = res.json()

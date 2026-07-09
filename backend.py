@@ -1,5 +1,7 @@
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional, Dict
 import os
 import json
 import tempfile
@@ -7,14 +9,12 @@ import uuid
 import shutil
 import time
 from datetime import datetime
-from sqlalchemy import create_engine, text
+import redis
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_groq import ChatGroq
 from langchain_chroma import Chroma
-from langchain_community.chat_message_histories import SQLChatMessageHistory
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from groq import RateLimitError, APIConnectionError, APIStatusError, InternalServerError
 from dotenv import load_dotenv
 
@@ -29,13 +29,55 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DB_FILE = "docuchat.db"
-CHAT_HISTORY_CONNECTION = f"sqlite:///{DB_FILE}"
 CHROMA_STORAGE_DIR = "chroma_sessions"
 
-engine = create_engine(CHAT_HISTORY_CONNECTION)
-
 vectorstore_cache = {}
+
+# ---------------------------------------------------------
+# REDIS SETUP (replaces in-memory chat_histories + session_metadata)
+# ---------------------------------------------------------
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+
+redis_client = redis.Redis(
+    host=REDIS_HOST,
+    port=REDIS_PORT,
+    db=0,
+    decode_responses=True  # taake Redis se hamesha str milay, bytes nahi
+)
+
+SESSIONS_INDEX_KEY = "sessions_index"  # Set of all session_ids
+
+
+def history_key(session_id: str) -> str:
+    return f"chat_history:{session_id}"
+
+
+def meta_key(session_id: str) -> str:
+    return f"session_meta:{session_id}"
+
+
+# ---------------------------------------------------------
+# PYDANTIC MODELS (request/response validation)
+# ---------------------------------------------------------
+class ChatRequest(BaseModel):
+    session_id: str
+    query: str
+
+
+class ChatResponse(BaseModel):
+    answer: Optional[str] = None
+    sources: List[int] = []
+    error: Optional[str] = None
+
+
+class SessionMeta(BaseModel):
+    filename: str
+    title: str
+    db_path: str
+    pages: int
+    chunks: int
+    created_at: str
 
 
 def clean_text(text_):
@@ -50,27 +92,54 @@ def make_title_from_query(query: str) -> str:
     return title if title else "New Chat"
 
 
-def get_chat_history(session_id):
-    """LangChain ka history object — ye khud database mein save/load karta hai"""
-    return SQLChatMessageHistory(
-        session_id=session_id,
-        connection=CHAT_HISTORY_CONNECTION
-    )
+# ---------------------------------------------------------
+# REDIS HELPER FUNCTIONS (chat history)
+# ---------------------------------------------------------
+def get_chat_history(session_id: str) -> List[Dict]:
+    """Session ki poori message list Redis se nikalna"""
+    raw_messages = redis_client.lrange(history_key(session_id), 0, -1)
+    return [json.loads(m) for m in raw_messages]
 
 
-def get_session_meta(session_id):
-    """Session ka metadata LangChain history mein save kiye gaye System message se nikalna"""
-    history = get_chat_history(session_id)
-    system_messages = [m for m in history.messages if isinstance(m, SystemMessage)]
-    if not system_messages:
+def append_chat_message(session_id: str, role: str, content: str):
+    """Ek naya message Redis list mein append (rpush) karna"""
+    message = {
+        "role": role,
+        "content": content,
+        "timestamp": datetime.now().isoformat()
+    }
+    redis_client.rpush(history_key(session_id), json.dumps(message))
+
+
+def init_chat_history(session_id: str):
+    """Naye session ke liye history key ko explicitly empty state mein rakhna
+    (Redis mein khud list tab tak nahi banti jab tak pehla rpush na ho, isliye
+    yahan kuch karne ki zaroorat nahi — bas function documentation ke liye rakha hai)"""
+    pass
+
+
+# ---------------------------------------------------------
+# REDIS HELPER FUNCTIONS (session metadata)
+# ---------------------------------------------------------
+def get_session_meta(session_id: str) -> Optional[Dict]:
+    """Session ka metadata Redis se nikalna"""
+    raw = redis_client.get(meta_key(session_id))
+    if raw is None:
         return None
-    return json.loads(system_messages[-1].content)
+    return json.loads(raw)
 
 
-def save_session_meta(session_id, meta: dict):
-    """Session ka metadata System message ke roop mein LangChain history mein save karna"""
-    history = get_chat_history(session_id)
-    history.add_message(SystemMessage(content=json.dumps(meta)))
+def save_session_meta(session_id: str, meta: dict):
+    """Session ka metadata Redis mein save karna + index set mein session_id add karna"""
+    redis_client.set(meta_key(session_id), json.dumps(meta))
+    redis_client.sadd(SESSIONS_INDEX_KEY, session_id)
+
+
+def delete_session_data(session_id: str):
+    """Session ki history + metadata Redis se poori tarah hatana"""
+    redis_client.delete(history_key(session_id))
+    redis_client.delete(meta_key(session_id))
+    redis_client.srem(SESSIONS_INDEX_KEY, session_id)
 
 
 def get_vectorstore(session_id, db_path):
@@ -91,7 +160,12 @@ def root():
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "version": "1.0.1"}
+    try:
+        redis_client.ping()
+        redis_status = "connected"
+    except redis.exceptions.ConnectionError:
+        redis_status = "disconnected"
+    return {"status": "ok", "version": "1.1.0", "redis": redis_status}
 
 
 @app.post("/upload")
@@ -125,14 +199,18 @@ async def upload_pdf(file: UploadFile = File(...)):
     )
     vectorstore_cache[session_id] = vectorstore
 
-    save_session_meta(session_id, {
-        "filename": file.filename,
-        "title": file.filename,
-        "db_path": db_path,
-        "pages": len(pages),
-        "chunks": len(chunks),
-        "created_at": datetime.now().isoformat()
-    })
+    meta = SessionMeta(
+        filename=file.filename,
+        title=file.filename,
+        db_path=db_path,
+        pages=len(pages),
+        chunks=len(chunks),
+        created_at=datetime.now().isoformat()
+    )
+    save_session_meta(session_id, meta.dict())
+
+    # Naye session ke liye history abhi khali hai (koi rpush nahi hua abhi tak)
+    init_chat_history(session_id)
 
     os.unlink(tmp_path)
 
@@ -146,21 +224,20 @@ async def upload_pdf(file: UploadFile = File(...)):
 
 @app.get("/sessions")
 def list_sessions():
-    """Sab purani chats ki list dena (title ke saath, ChatGPT jaisa)"""
-    with engine.connect() as conn:
-        result = conn.execute(text("SELECT DISTINCT session_id FROM message_store"))
-        session_ids = [row[0] for row in result]
+    """Sab purani chats ki list dena (title ke saath, ChatGPT jaisa) — ab Redis se"""
+    session_ids = redis_client.smembers(SESSIONS_INDEX_KEY)
 
     sessions = []
     for sid in session_ids:
         meta = get_session_meta(sid)
-        if meta:
-            sessions.append({
-                "session_id": sid,
-                "filename": meta.get("filename"),
-                "title": meta.get("title") or meta.get("filename"),
-                "created_at": meta.get("created_at")
-            })
+        if meta is None:
+            continue
+        sessions.append({
+            "session_id": sid,
+            "filename": meta.get("filename"),
+            "title": meta.get("title") or meta.get("filename"),
+            "created_at": meta.get("created_at")
+        })
 
     sessions.sort(key=lambda s: s["created_at"] or "", reverse=True)
     return {"sessions": sessions}
@@ -168,14 +245,9 @@ def list_sessions():
 
 @app.get("/sessions/{session_id}/messages")
 def get_messages(session_id: str):
-    """Ek specific session ki poori chat history dena — ab LangChain se"""
+    """Ek specific session ki poori chat history dena — ab Redis list se"""
     history = get_chat_history(session_id)
-    messages = []
-    for msg in history.messages:
-        if isinstance(msg, SystemMessage):
-            continue
-        role = "user" if isinstance(msg, HumanMessage) else "assistant"
-        messages.append({"role": role, "content": msg.content})
+    messages = [{"role": m["role"], "content": m["content"]} for m in history]
     return {"messages": messages}
 
 
@@ -190,28 +262,28 @@ def delete_session(session_id: str):
             shutil.rmtree(db_path, ignore_errors=True)
 
     vectorstore_cache.pop(session_id, None)
-
-    history = get_chat_history(session_id)
-    history.clear()
+    delete_session_data(session_id)
 
     return {"status": "deleted"}
 
 
-@app.post("/chat")
-async def chat(session_id: str = Form(...), query: str = Form(...)):
+@app.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
     """Ek session ke PDF se sawal poochna"""
+
+    session_id = request.session_id
+    query = request.query
 
     meta = get_session_meta(session_id)
     if not meta:
-        return {"error": "Session nahi mila.", "answer": None, "sources": []}
+        return ChatResponse(error="Session nahi mila.", answer=None, sources=[])
 
     db_path = meta["db_path"]
     vectorstore = get_vectorstore(session_id, db_path)
 
     history = get_chat_history(session_id)
-    real_messages = [m for m in history.messages if not isinstance(m, SystemMessage)]
 
-    if len(real_messages) == 0:
+    if len(history) == 0:
         meta["title"] = make_title_from_query(query)
         save_session_meta(session_id, meta)
 
@@ -227,11 +299,11 @@ async def chat(session_id: str = Form(...), query: str = Form(...)):
             sources.append(page_num + 1)
             seen_pages.add(page_num)
 
-    recent_messages = real_messages[-6:]
+    recent_messages = history[-6:]
     history_text = ""
     for msg in recent_messages:
-        role_label = "User" if isinstance(msg, HumanMessage) else "Assistant"
-        history_text += f"{role_label}: {msg.content}\n"
+        role_label = "User" if msg["role"] == "user" else "Assistant"
+        history_text += f"{role_label}: {msg['content']}\n"
 
     llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.3)
 
@@ -264,43 +336,43 @@ Answer:"""
             break
 
         except RateLimitError:
-            return {
-                "error": "Groq API ki rate limit / quota abhi khatam ho chuki hai. "
-                         "Thodi dair baad try karein, ya console.groq.com par apna usage check karein.",
-                "answer": None,
-                "sources": []
-            }
+            return ChatResponse(
+                error="Groq API ki rate limit / quota abhi khatam ho chuki hai. "
+                      "Thodi dair baad try karein, ya console.groq.com par apna usage check karein.",
+                answer=None,
+                sources=[]
+            )
 
         except InternalServerError:
             if attempt < max_retries:
                 time.sleep(3)
                 continue
-            return {
-                "error": "Groq model abhi busy/unavailable hai. Thodi dair baad try karein.",
-                "answer": None,
-                "sources": []
-            }
+            return ChatResponse(
+                error="Groq model abhi busy/unavailable hai. Thodi dair baad try karein.",
+                answer=None,
+                sources=[]
+            )
 
         except APIConnectionError:
             if attempt < max_retries:
                 time.sleep(2)
                 continue
-            return {
-                "error": "Groq API se connection nahi ho pa raha. Apna internet connection check karein.",
-                "answer": None,
-                "sources": []
-            }
+            return ChatResponse(
+                error="Groq API se connection nahi ho pa raha. Apna internet connection check karein.",
+                answer=None,
+                sources=[]
+            )
 
         except APIStatusError as e:
-            return {"error": f"Groq API error: {str(e)}", "answer": None, "sources": []}
+            return ChatResponse(error=f"Groq API error: {str(e)}", answer=None, sources=[])
 
         except Exception as e:
-            return {"error": f"Unexpected error: {str(e)}", "answer": None, "sources": []}
+            return ChatResponse(error=f"Unexpected error: {str(e)}", answer=None, sources=[])
 
     if answer is None:
-        return {"error": "Response nahi mil saka. Dobara try karein.", "answer": None, "sources": []}
+        return ChatResponse(error="Response nahi mil saka. Dobara try karein.", answer=None, sources=[])
 
-    history.add_user_message(query)
-    history.add_ai_message(answer)
+    append_chat_message(session_id, "user", query)
+    append_chat_message(session_id, "assistant", answer)
 
-    return {"answer": answer, "sources": sorted(sources)}
+    return ChatResponse(answer=answer, sources=sorted(sources))

@@ -1,5 +1,6 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 import os
@@ -18,6 +19,8 @@ from langchain_chroma import Chroma
 from groq import RateLimitError, APIConnectionError, APIStatusError, InternalServerError
 from dotenv import load_dotenv
 
+from auth import hash_password, verify_password, create_access_token, decode_access_token
+
 load_dotenv()
 
 app = FastAPI(title="DocuChat AI Backend")
@@ -27,6 +30,7 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 CHROMA_STORAGE_DIR = "chroma_sessions"
@@ -34,7 +38,7 @@ CHROMA_STORAGE_DIR = "chroma_sessions"
 vectorstore_cache = {}
 
 # ---------------------------------------------------------
-# REDIS SETUP (replaces in-memory chat_histories + session_metadata)
+# REDIS SETUP
 # ---------------------------------------------------------
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
@@ -43,10 +47,10 @@ redis_client = redis.Redis(
     host=REDIS_HOST,
     port=REDIS_PORT,
     db=0,
-    decode_responses=True  # taake Redis se hamesha str milay, bytes nahi
+    decode_responses=True
 )
 
-SESSIONS_INDEX_KEY = "sessions_index"  # Set of all session_ids
+SESSIONS_INDEX_KEY = "sessions_index"
 
 
 def history_key(session_id: str) -> str:
@@ -57,8 +61,63 @@ def meta_key(session_id: str) -> str:
     return f"session_meta:{session_id}"
 
 
+def user_key(email: str) -> str:
+    return f"user:{email}"
+
+
+def user_sessions_key(user_id: str) -> str:
+    return f"user_sessions:{user_id}"
+
+
 # ---------------------------------------------------------
-# PYDANTIC MODELS (request/response validation)
+# AUTH SETUP
+# ---------------------------------------------------------
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
+
+def get_user_by_email(email: str) -> Optional[Dict]:
+    raw = redis_client.get(user_key(email))
+    if raw is None:
+        return None
+    return json.loads(raw)
+
+
+def create_user(email: str, password: str) -> Dict:
+    user_id = str(uuid.uuid4())
+    user_data = {
+        "user_id": user_id,
+        "email": email,
+        "hashed_password": hash_password(password),
+        "created_at": datetime.now().isoformat()
+    }
+    redis_client.set(user_key(email), json.dumps(user_data))
+    return user_data
+
+
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> Dict:
+    """Har protected endpoint pe token check karna"""
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Token invalid ya expire ho chuka hai. Dobara login karein.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    payload = decode_access_token(token)
+    if payload is None:
+        raise credentials_exception
+
+    email = payload.get("sub")
+    if email is None:
+        raise credentials_exception
+
+    user = get_user_by_email(email)
+    if user is None:
+        raise credentials_exception
+
+    return user
+
+
+# ---------------------------------------------------------
+# PYDANTIC MODELS
 # ---------------------------------------------------------
 class ChatRequest(BaseModel):
     session_id: str
@@ -80,12 +139,22 @@ class SessionMeta(BaseModel):
     created_at: str
 
 
+class SignupRequest(BaseModel):
+    email: str
+    password: str
+
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    email: str
+
+
 def clean_text(text_):
     return text_.encode('utf-8', 'ignore').decode('utf-8')
 
 
 def make_title_from_query(query: str) -> str:
-    """User ke pehle sawal se ek chota, saaf title banana (ChatGPT jaisa)"""
     title = query.strip().replace("\n", " ")
     if len(title) > 45:
         title = title[:45].rsplit(" ", 1)[0] + "..."
@@ -96,13 +165,11 @@ def make_title_from_query(query: str) -> str:
 # REDIS HELPER FUNCTIONS (chat history)
 # ---------------------------------------------------------
 def get_chat_history(session_id: str) -> List[Dict]:
-    """Session ki poori message list Redis se nikalna"""
     raw_messages = redis_client.lrange(history_key(session_id), 0, -1)
     return [json.loads(m) for m in raw_messages]
 
 
 def append_chat_message(session_id: str, role: str, content: str):
-    """Ek naya message Redis list mein append (rpush) karna"""
     message = {
         "role": role,
         "content": content,
@@ -112,9 +179,6 @@ def append_chat_message(session_id: str, role: str, content: str):
 
 
 def init_chat_history(session_id: str):
-    """Naye session ke liye history key ko explicitly empty state mein rakhna
-    (Redis mein khud list tab tak nahi banti jab tak pehla rpush na ho, isliye
-    yahan kuch karne ki zaroorat nahi — bas function documentation ke liye rakha hai)"""
     pass
 
 
@@ -122,28 +186,29 @@ def init_chat_history(session_id: str):
 # REDIS HELPER FUNCTIONS (session metadata)
 # ---------------------------------------------------------
 def get_session_meta(session_id: str) -> Optional[Dict]:
-    """Session ka metadata Redis se nikalna"""
     raw = redis_client.get(meta_key(session_id))
     if raw is None:
         return None
     return json.loads(raw)
 
 
-def save_session_meta(session_id: str, meta: dict):
-    """Session ka metadata Redis mein save karna + index set mein session_id add karna"""
+def save_session_meta(session_id: str, meta: dict, user_id: str = None):
+    """Session ka metadata Redis mein save karna + global index + user-specific index mein add karna"""
     redis_client.set(meta_key(session_id), json.dumps(meta))
     redis_client.sadd(SESSIONS_INDEX_KEY, session_id)
+    if user_id:
+        redis_client.sadd(user_sessions_key(user_id), session_id)
 
 
-def delete_session_data(session_id: str):
-    """Session ki history + metadata Redis se poori tarah hatana"""
+def delete_session_data(session_id: str, user_id: str = None):
     redis_client.delete(history_key(session_id))
     redis_client.delete(meta_key(session_id))
     redis_client.srem(SESSIONS_INDEX_KEY, session_id)
+    if user_id:
+        redis_client.srem(user_sessions_key(user_id), session_id)
 
 
 def get_vectorstore(session_id, db_path):
-    """Vectorstore ko cache se ya disk se load karna"""
     if session_id in vectorstore_cache:
         return vectorstore_cache[session_id]
 
@@ -153,6 +218,9 @@ def get_vectorstore(session_id, db_path):
     return vectorstore
 
 
+# ---------------------------------------------------------
+# BASIC ENDPOINTS
+# ---------------------------------------------------------
 @app.get("/")
 def root():
     return {"status": "DocuChat AI Backend chal raha hai ✅"}
@@ -165,12 +233,55 @@ def health_check():
         redis_status = "connected"
     except redis.exceptions.ConnectionError:
         redis_status = "disconnected"
-    return {"status": "ok", "version": "1.1.0", "redis": redis_status}
+    return {"status": "ok", "version": "1.2.0", "redis": redis_status}
 
 
+@app.get("/me")
+def get_me(current_user: Dict = Depends(get_current_user)):
+    """Current logged-in user ki basic info dena (frontend sidebar ke liye)"""
+    return {"email": current_user["email"], "user_id": current_user["user_id"]}
+
+
+# ---------------------------------------------------------
+# AUTH ENDPOINTS
+# ---------------------------------------------------------
+@app.post("/signup")
+def signup(request: SignupRequest):
+    """Naya account banana"""
+    existing_user = get_user_by_email(request.email)
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Ye email pehle se registered hai.")
+
+    if len(request.password) < 6:
+        raise HTTPException(status_code=400, detail="Password kam az kam 6 characters ka hona chahiye.")
+
+    user = create_user(request.email, request.password)
+
+    return {"message": "Account successfully ban gaya", "email": user["email"]}
+
+
+@app.post("/login", response_model=LoginResponse)
+def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    """Login kar ke JWT token lena"""
+    user = get_user_by_email(form_data.username)
+
+    if not user or not verify_password(form_data.password, user["hashed_password"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Email ya password ghalat hai.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    access_token = create_access_token(data={"sub": user["email"]})
+    return LoginResponse(access_token=access_token, email=user["email"])
+
+
+# ---------------------------------------------------------
+# PROTECTED ENDPOINTS (login zaroori hai)
+# ---------------------------------------------------------
 @app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
-    """PDF upload kar ke process karna aur permanent session banana"""
+async def upload_pdf(file: UploadFile = File(...), current_user: Dict = Depends(get_current_user)):
+    """PDF upload kar ke process karna aur permanent session banana (sirf logged-in user)"""
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
         content = await file.read()
@@ -207,9 +318,10 @@ async def upload_pdf(file: UploadFile = File(...)):
         chunks=len(chunks),
         created_at=datetime.now().isoformat()
     )
-    save_session_meta(session_id, meta.dict())
+    meta_dict = meta.dict()
+    meta_dict["user_id"] = current_user["user_id"]
 
-    # Naye session ke liye history abhi khali hai (koi rpush nahi hua abhi tak)
+    save_session_meta(session_id, meta_dict, user_id=current_user["user_id"])
     init_chat_history(session_id)
 
     os.unlink(tmp_path)
@@ -223,9 +335,9 @@ async def upload_pdf(file: UploadFile = File(...)):
 
 
 @app.get("/sessions")
-def list_sessions():
-    """Sab purani chats ki list dena (title ke saath, ChatGPT jaisa) — ab Redis se"""
-    session_ids = redis_client.smembers(SESSIONS_INDEX_KEY)
+def list_sessions(current_user: Dict = Depends(get_current_user)):
+    """Sirf LOGGED-IN user ki chats dikhana"""
+    session_ids = redis_client.smembers(user_sessions_key(current_user["user_id"]))
 
     sessions = []
     for sid in session_ids:
@@ -244,32 +356,38 @@ def list_sessions():
 
 
 @app.get("/sessions/{session_id}/messages")
-def get_messages(session_id: str):
-    """Ek specific session ki poori chat history dena — ab Redis list se"""
+def get_messages(session_id: str, current_user: Dict = Depends(get_current_user)):
+    """Ek specific session ki poori chat history dena — sirf agar owner ho"""
+    meta = get_session_meta(session_id)
+    if meta is None or meta.get("user_id") != current_user["user_id"]:
+        raise HTTPException(status_code=403, detail="Ye chat aapki nahi hai.")
+
     history = get_chat_history(session_id)
     messages = [{"role": m["role"], "content": m["content"]} for m in history]
     return {"messages": messages}
 
 
 @app.delete("/sessions/{session_id}")
-def delete_session(session_id: str):
-    """Ek chat ko poori tarah delete karna"""
+def delete_session(session_id: str, current_user: Dict = Depends(get_current_user)):
+    """Ek chat ko poori tarah delete karna — sirf agar owner ho"""
     meta = get_session_meta(session_id)
 
-    if meta:
-        db_path = meta.get("db_path")
-        if db_path and os.path.exists(db_path):
-            shutil.rmtree(db_path, ignore_errors=True)
+    if meta is None or meta.get("user_id") != current_user["user_id"]:
+        raise HTTPException(status_code=403, detail="Ye chat aapki nahi hai.")
+
+    db_path = meta.get("db_path")
+    if db_path and os.path.exists(db_path):
+        shutil.rmtree(db_path, ignore_errors=True)
 
     vectorstore_cache.pop(session_id, None)
-    delete_session_data(session_id)
+    delete_session_data(session_id, user_id=current_user["user_id"])
 
     return {"status": "deleted"}
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
-    """Ek session ke PDF se sawal poochna"""
+async def chat(request: ChatRequest, current_user: Dict = Depends(get_current_user)):
+    """Ek session ke PDF se sawal poochna — sirf agar owner ho"""
 
     session_id = request.session_id
     query = request.query
@@ -278,6 +396,9 @@ async def chat(request: ChatRequest):
     if not meta:
         return ChatResponse(error="Session nahi mila.", answer=None, sources=[])
 
+    if meta.get("user_id") != current_user["user_id"]:
+        raise HTTPException(status_code=403, detail="Ye chat aapki nahi hai.")
+
     db_path = meta["db_path"]
     vectorstore = get_vectorstore(session_id, db_path)
 
@@ -285,7 +406,7 @@ async def chat(request: ChatRequest):
 
     if len(history) == 0:
         meta["title"] = make_title_from_query(query)
-        save_session_meta(session_id, meta)
+        save_session_meta(session_id, meta, user_id=current_user["user_id"])
 
     results = vectorstore.similarity_search_with_score(query, k=5)
     relevant_docs = [doc for doc, score in results if score < 1.0]

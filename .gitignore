@@ -7,3 +7,16 @@ venv/
 __pycache__/
 *.pyc
 .env
+# Databases
+*.db
+docuchat.db
+
+# Test/sample files
+sample.pdf
+temp_sample.pdf
+temp_easyocr_page_*.png
+temp_*.pdf
+
+# Chroma
+chroma_db/
+chroma_sessions/

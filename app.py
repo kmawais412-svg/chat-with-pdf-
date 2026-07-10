@@ -47,17 +47,32 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# ---------------------------------------------------------
+# SESSION STATE INIT
+# ---------------------------------------------------------
 if "session_id" not in st.session_state:
     st.session_state.session_id = None
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "pdf_name" not in st.session_state:
     st.session_state.pdf_name = None
+if "access_token" not in st.session_state:
+    st.session_state.access_token = None
+if "user_email" not in st.session_state:
+    st.session_state.user_email = None
+
+
+def get_auth_headers():
+    """Har request ke sath bhejne wala Authorization header"""
+    return {"Authorization": f"Bearer {st.session_state.access_token}"}
 
 
 def load_session_messages(session_id):
     try:
-        res = requests.get(f"{BACKEND_URL}/sessions/{session_id}/messages")
+        res = requests.get(
+            f"{BACKEND_URL}/sessions/{session_id}/messages",
+            headers=get_auth_headers()
+        )
         if res.status_code == 200:
             return res.json()["messages"]
     except requests.exceptions.ConnectionError:
@@ -67,7 +82,7 @@ def load_session_messages(session_id):
 
 def get_all_sessions():
     try:
-        res = requests.get(f"{BACKEND_URL}/sessions")
+        res = requests.get(f"{BACKEND_URL}/sessions", headers=get_auth_headers())
         if res.status_code == 200:
             return res.json()["sessions"]
     except requests.exceptions.ConnectionError:
@@ -75,149 +90,240 @@ def get_all_sessions():
     return []
 
 
-# ---------- Sidebar ----------
-with st.sidebar:
-    st.markdown("### 📚 DocuChat AI")
-    st.caption("Retrieval-Augmented Document Assistant")
-    st.divider()
+# ---------------------------------------------------------
+# LOGIN / SIGNUP SCREEN (agar user login nahi hai)
+# ---------------------------------------------------------
+def show_auth_screen():
+    st.markdown('<p class="main-header">DocuChat AI</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sub-header">Apne PDFs se baat karein — pehle login ya signup karein.</p>', unsafe_allow_html=True)
 
-    if st.button("➕ New Chat", use_container_width=True, type="primary"):
-        st.session_state.session_id = None
-        st.session_state.chat_history = []
-        st.session_state.pdf_name = None
-        st.rerun()
+    tab_login, tab_signup = st.tabs(["🔑 Login", "📝 Signup"])
 
-    st.markdown("#### 📤 Upload Document")
-    uploaded_file = st.file_uploader("Choose a PDF file", type="pdf", label_visibility="collapsed")
+    with tab_login:
+        with st.form("login_form"):
+            email = st.text_input("Email", key="login_email")
+            password = st.text_input("Password", type="password", key="login_password")
+            submitted = st.form_submit_button("Login", use_container_width=True, type="primary")
 
-    if uploaded_file is not None:
-        if st.button("⚡ Process Document", use_container_width=True):
-            with st.spinner("Analyzing document..."):
-                try:
-                    files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")}
-                    res = requests.post(f"{BACKEND_URL}/upload", files=files)
-                    if res.status_code == 200:
-                        data = res.json()
-                        st.session_state.session_id = data["session_id"]
-                        st.session_state.pdf_name = data["filename"]
-                        st.session_state.chat_history = []
-                        st.success("Document ready!")
-                        st.rerun()
-                    else:
-                        st.error(f"Backend error: {res.text}")
-                except requests.exceptions.ConnectionError:
-                    st.error("⚠️ Backend se connect nahi ho pa raha.")
-
-    st.divider()
-    st.markdown("#### 💬 Previous Chats")
-
-    sessions = get_all_sessions()
-
-    if not sessions:
-        st.caption("Koi purani chat nahi hai.")
-
-    # Har session ChatGPT jaisa ek alag, isolated conversation hai —
-    # click karne par sirf USI session ki history load hoti hai (koi mix nahi)
-    for s in sessions:
-        display_title = s.get("title") or s["filename"]
-        label = display_title[:28] + ("..." if len(display_title) > 28 else "")
-        is_active = (st.session_state.session_id == s["session_id"])
-
-        col1, col2 = st.columns([4, 1])
-        with col1:
-            if st.button(
-                f"{'🟣' if is_active else '📄'} {label}",
-                key=f"select_{s['session_id']}",
-                use_container_width=True,
-                type="primary" if is_active else "secondary"
-            ):
-                # Yahan poori tarah is session par switch hota hai:
-                # session_id badalta hai aur SIRF isi session ki messages load hoti hain
-                st.session_state.session_id = s["session_id"]
-                st.session_state.pdf_name = s["filename"]
-                st.session_state.chat_history = load_session_messages(s["session_id"])
-                st.rerun()
-        with col2:
-            if st.button("🗑️", key=f"delete_{s['session_id']}"):
-                requests.delete(f"{BACKEND_URL}/sessions/{s['session_id']}")
-                if st.session_state.session_id == s["session_id"]:
-                    st.session_state.session_id = None
-                    st.session_state.chat_history = []
-                    st.session_state.pdf_name = None
-                st.rerun()
-
-    st.markdown("<br>", unsafe_allow_html=True)
-    st.caption("Frontend: Streamlit · Backend: FastAPI")
-
-# ---------- Main ----------
-st.markdown('<p class="main-header">Chat with your Documents</p>', unsafe_allow_html=True)
-st.markdown('<p class="sub-header">Upload a PDF and get instant, grounded answers — powered by RAG.</p>', unsafe_allow_html=True)
-
-if st.session_state.session_id is None:
-    st.markdown("""
-    <div class="status-card">
-        👋 <strong>Get started:</strong> Upload a PDF from the sidebar, or select a previous chat to continue.
-    </div>
-    """, unsafe_allow_html=True)
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.info("**🔍 Smart Retrieval**\n\nFinds the most relevant sections of your document.")
-    with col2:
-        st.info("**💾 Persistent History**\n\nAll your chats are saved and available anytime.")
-    with col3:
-        st.info("**🔒 Grounded Answers**\n\nResponses are based on your document's content.")
-
-else:
-    st.markdown(f"""
-    <div class="status-card">
-        ✅ <strong>{st.session_state.pdf_name}</strong> — ask anything below.
-    </div>
-    """, unsafe_allow_html=True)
-
-    for msg in st.session_state.chat_history:
-        with st.chat_message(msg["role"]):
-            st.write(msg["content"])
-
-    query = st.chat_input("Ask a question about your document...")
-
-    if query:
-        with st.chat_message("user"):
-            st.write(query)
-        st.session_state.chat_history.append({"role": "user", "content": query})
-
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                answer = None
-                sources = []
-                try:
-                    # NOTE: backend ka /chat endpoint ab Pydantic ChatRequest (JSON body)
-                    # expect karta hai, isliye "data=" ki jagah "json=" use ho raha hai.
-                    res = requests.post(
-                        f"{BACKEND_URL}/chat",
-                        json={"session_id": st.session_state.session_id, "query": query}
-                    )
-                    if res.status_code == 200:
-                        result = res.json()
-                        if result.get("error"):
-                            answer = f"⚠️ {result['error']}"
+            if submitted:
+                if not email or not password:
+                    st.error("Email aur password dono zaroori hain.")
+                else:
+                    try:
+                        # OAuth2PasswordRequestForm expects form-data, JSON nahi
+                        res = requests.post(
+                            f"{BACKEND_URL}/login",
+                            data={"username": email, "password": password}
+                        )
+                        if res.status_code == 200:
+                            token_data = res.json()
+                            st.session_state.access_token = token_data["access_token"]
+                            st.session_state.user_email = email
+                            st.success("Login successful!")
+                            st.rerun()
                         else:
-                            answer = result["answer"]
-                            sources = result.get("sources", [])
-                    else:
-                        answer = f"⚠️ Backend error: {res.text}"
-                except requests.exceptions.ConnectionError:
-                    answer = "⚠️ Backend se connect nahi ho pa raha. Check karein ke uvicorn server chal raha hai."
+                            error_detail = res.json().get("detail", "Login fail ho gaya.")
+                            st.error(f"⚠️ {error_detail}")
+                    except requests.exceptions.ConnectionError:
+                        st.error("⚠️ Backend se connect nahi ho pa raha.")
 
-                st.write(answer)
-                if sources:
-                    pages_str = ", ".join([str(p) for p in sources])
-                    st.caption(f"📄 Source: Page {pages_str}")
+    with tab_signup:
+        with st.form("signup_form"):
+            new_email = st.text_input("Email", key="signup_email")
+            new_password = st.text_input("Password (kam az kam 6 characters)", type="password", key="signup_password")
+            confirm_password = st.text_input("Confirm Password", type="password", key="signup_confirm")
+            submitted = st.form_submit_button("Sign Up", use_container_width=True, type="primary")
 
-        st.session_state.chat_history.append({"role": "assistant", "content": answer})
+            if submitted:
+                if not new_email or not new_password:
+                    st.error("Email aur password dono zaroori hain.")
+                elif new_password != confirm_password:
+                    st.error("Password match nahi kar raha.")
+                else:
+                    try:
+                        res = requests.post(
+                            f"{BACKEND_URL}/signup",
+                            json={"email": new_email, "password": new_password}
+                        )
+                        if res.status_code == 200:
+                            st.success("Account ban gaya! Ab 'Login' tab se login karein.")
+                        else:
+                            error_detail = res.json().get("detail", "Signup fail ho gaya.")
+                            st.error(f"⚠️ {error_detail}")
+                    except requests.exceptions.ConnectionError:
+                        st.error("⚠️ Backend se connect nahi ho pa raha.")
 
-        # Pehle sawal ke baad backend title generate karta hai —
-        # sidebar ko turant refresh karna taake naya title turant dikhe
-        st.rerun()
 
-st.markdown('<p class="footer-note">DocuChat AI — Streamlit + FastAPI + Gemini + ChromaDB + SQLite</p>', unsafe_allow_html=True)
+# ---------------------------------------------------------
+# MAIN APP (agar user login hai)
+# ---------------------------------------------------------
+def show_main_app():
+    # ---------- Sidebar ----------
+    with st.sidebar:
+        st.markdown("### 📚 DocuChat AI")
+        st.caption(f"Logged in as: **{st.session_state.user_email}**")
+        st.divider()
+
+        if st.button("🚪 Logout", use_container_width=True):
+            st.session_state.access_token = None
+            st.session_state.user_email = None
+            st.session_state.session_id = None
+            st.session_state.chat_history = []
+            st.session_state.pdf_name = None
+            st.rerun()
+
+        if st.button("➕ New Chat", use_container_width=True, type="primary"):
+            st.session_state.session_id = None
+            st.session_state.chat_history = []
+            st.session_state.pdf_name = None
+            st.rerun()
+
+        st.markdown("#### 📤 Upload Document")
+        uploaded_file = st.file_uploader("Choose a PDF file", type="pdf", label_visibility="collapsed")
+
+        if uploaded_file is not None:
+            if st.button("⚡ Process Document", use_container_width=True):
+                with st.spinner("Analyzing document..."):
+                    try:
+                        files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")}
+                        res = requests.post(
+                            f"{BACKEND_URL}/upload",
+                            files=files,
+                            headers=get_auth_headers()
+                        )
+                        if res.status_code == 200:
+                            data = res.json()
+                            st.session_state.session_id = data["session_id"]
+                            st.session_state.pdf_name = data["filename"]
+                            st.session_state.chat_history = []
+                            st.success("Document ready!")
+                            st.rerun()
+                        elif res.status_code == 401:
+                            st.error("Session expire ho chuki hai, dobara login karein.")
+                            st.session_state.access_token = None
+                            st.rerun()
+                        else:
+                            st.error(f"Backend error: {res.text}")
+                    except requests.exceptions.ConnectionError:
+                        st.error("⚠️ Backend se connect nahi ho pa raha.")
+
+        st.divider()
+        st.markdown("#### 💬 Previous Chats")
+
+        sessions = get_all_sessions()
+
+        if not sessions:
+            st.caption("Koi purani chat nahi hai.")
+
+        for s in sessions:
+            display_title = s.get("title") or s["filename"]
+            label = display_title[:28] + ("..." if len(display_title) > 28 else "")
+            is_active = (st.session_state.session_id == s["session_id"])
+
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                if st.button(
+                    f"{'🟣' if is_active else '📄'} {label}",
+                    key=f"select_{s['session_id']}",
+                    use_container_width=True,
+                    type="primary" if is_active else "secondary"
+                ):
+                    st.session_state.session_id = s["session_id"]
+                    st.session_state.pdf_name = s["filename"]
+                    st.session_state.chat_history = load_session_messages(s["session_id"])
+                    st.rerun()
+            with col2:
+                if st.button("🗑️", key=f"delete_{s['session_id']}"):
+                    requests.delete(
+                        f"{BACKEND_URL}/sessions/{s['session_id']}",
+                        headers=get_auth_headers()
+                    )
+                    if st.session_state.session_id == s["session_id"]:
+                        st.session_state.session_id = None
+                        st.session_state.chat_history = []
+                        st.session_state.pdf_name = None
+                    st.rerun()
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.caption("Frontend: Streamlit · Backend: FastAPI")
+
+    # ---------- Main ----------
+    st.markdown('<p class="main-header">Chat with your Documents</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sub-header">Upload a PDF and get instant, grounded answers — powered by RAG.</p>', unsafe_allow_html=True)
+
+    if st.session_state.session_id is None:
+        st.markdown("""
+        <div class="status-card">
+            👋 <strong>Get started:</strong> Upload a PDF from the sidebar, or select a previous chat to continue.
+        </div>
+        """, unsafe_allow_html=True)
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.info("**🔍 Smart Retrieval**\n\nFinds the most relevant sections of your document.")
+        with col2:
+            st.info("**💾 Persistent History**\n\nAll your chats are saved and available anytime.")
+        with col3:
+            st.info("**🔒 Grounded Answers**\n\nResponses are based on your document's content.")
+
+    else:
+        st.markdown(f"""
+        <div class="status-card">
+            ✅ <strong>{st.session_state.pdf_name}</strong> — ask anything below.
+        </div>
+        """, unsafe_allow_html=True)
+
+        for msg in st.session_state.chat_history:
+            with st.chat_message(msg["role"]):
+                st.write(msg["content"])
+
+        query = st.chat_input("Ask a question about your document...")
+
+        if query:
+            with st.chat_message("user"):
+                st.write(query)
+            st.session_state.chat_history.append({"role": "user", "content": query})
+
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    answer = None
+                    sources = []
+                    try:
+                        res = requests.post(
+                            f"{BACKEND_URL}/chat",
+                            json={"session_id": st.session_state.session_id, "query": query},
+                            headers=get_auth_headers()
+                        )
+                        if res.status_code == 200:
+                            result = res.json()
+                            if result.get("error"):
+                                answer = f"⚠️ {result['error']}"
+                            else:
+                                answer = result["answer"]
+                                sources = result.get("sources", [])
+                        elif res.status_code == 401:
+                            answer = "⚠️ Session expire ho chuki hai. Page refresh kar ke dobara login karein."
+                            st.session_state.access_token = None
+                        else:
+                            answer = f"⚠️ Backend error: {res.text}"
+                    except requests.exceptions.ConnectionError:
+                        answer = "⚠️ Backend se connect nahi ho pa raha. Check karein ke uvicorn server chal raha hai."
+
+                    st.write(answer)
+                    if sources:
+                        pages_str = ", ".join([str(p) for p in sources])
+                        st.caption(f"📄 Source: Page {pages_str}")
+
+            st.session_state.chat_history.append({"role": "assistant", "content": answer})
+            st.rerun()
+
+    st.markdown('<p class="footer-note">DocuChat AI — Streamlit + FastAPI + Gemini + ChromaDB + Redis</p>', unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------
+# ROUTING: Login screen ya Main app
+# ---------------------------------------------------------
+if st.session_state.access_token is None:
+    show_auth_screen()
+else:
+    show_main_app()
